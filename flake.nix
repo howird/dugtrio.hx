@@ -20,7 +20,7 @@
         # A throwaway project that exercises the explorer: deep nesting (columns
         # drop off the left), many file types (icons), long and wide names
         # (truncation), an empty directory and a broken symlink (placeholders),
-        # and a git repository with staged, modified and untracked files.
+        # and dotfiles (visibility toggle).
         pkgs.writeShellApplication {
           name = "dugtrio-demo";
           runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.steelix ];
@@ -115,6 +115,7 @@
                     _ => eprintln!("usage: orchard <open|close|search>"),
                 }
             }
+            // TODO: handle --help
             EOF
             w src/lib.rs <<'EOF'
             pub mod commands;
@@ -155,6 +156,11 @@
                 println!("closed");
             }
             EOF
+            w src/commands/rename.rs <<'EOF'
+            pub fn run(from: &str, to: &str) {
+                println!("renaming {from} to {to}");
+            }
+            EOF
             w src/commands/search.rs <<'EOF'
             use crate::config::Config;
 
@@ -174,6 +180,7 @@
             }
 
             pub const DARK: Theme = Theme { text: "#d8d8d8", selection: "#b8b8b8", border: "#585858" };
+            pub const LIGHT: Theme = DARK;
             EOF
             w src/ui/widgets/mod.rs <<'EOF'
             pub mod columns;
@@ -249,11 +256,6 @@
                 { "name": "Conference", "kind": "pear", "planted": 2021 }
               ]
             }
-            EOF
-            w tests/fixtures/sample.toml <<'EOF'
-            [[trees]]
-            name = "Victoria"
-            kind = "plum"
             EOF
             w tests/fixtures/an-exceptionally-long-fixture-file-name-that-has-to-be-truncated-to-fit.txt <<'EOF'
             This file exists for its name.
@@ -342,23 +344,12 @@
 
             ln -s missing-target broken-link
 
-            # commit a baseline, then leave one change of each kind
-            git init -q
-            git add -A
-            git -c user.name=demo -c user.email=demo@example.invalid commit -q -m "Initial commit"
-            printf '%s\n' '// TODO: handle --help' >> src/main.rs
-            printf '%s\n' 'pub const LIGHT: Theme = DARK;' >> src/ui/theme.rs
-            w src/commands/rename.rs <<'EOF'
-            pub fn run(from: &str, to: &str) {
-                println!("renaming {from} to {to}");
-            }
-            EOF
-            git add src/commands/rename.rs
             w notes/todo.md <<'EOF'
             - [ ] catalogue the north row
             - [ ] label the grafts
             EOF
-            git rm -q tests/fixtures/sample.toml
+
+            git init -q
 
             if [ $# -eq 0 ]; then
               set -- src/ui/widgets/list.rs

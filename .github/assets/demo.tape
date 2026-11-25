@@ -1,44 +1,59 @@
 # Record from the repository root: nix develop -c vhs .github/assets/demo.tape
-# dugtrio-demo creates an isolated Helix configuration and a throwaway project.
-Require nix
+# The devShell's dugtrio-demo launches Helix with an isolated orchard fixture.
+Require dugtrio-demo
 
 Output .github/assets/preview.gif
 
 Set Shell "bash"
-Set Theme "VibrantInk"
+Set Theme "Dracula"
 Set FontFamily "Maple Mono NF"
-Set FontSize 18
-Set Width 1600
-Set Height 1000
+Set FontSize 21
+Set Width 1440
+Set Height 640
 Set Padding 20
-Set TypingSpeed 60ms
 Set WindowBar Colorful
+Set TypingSpeed 180ms
 
 Hide
-Type "nix run"
+Type "dugtrio-demo src/ui/widgets/mod.rs"
 Enter
-Sleep 5s
+Sleep 2s
+Type "-"
+Sleep 500ms
 Show
 
-# Open the explorer on the current file and browse its ancestor columns.
-Type "-"
-Sleep 1.5s
-Left
+# Browse from a file preview to a directory preview.
+Sleep 1.4s
+Up@160ms 2
+Sleep 1.3s
+
+# Dots in the orchard column disappear and return; focus stays put.
+Type "."
+Sleep 1.1s
+Type "."
+Sleep 1.1s
+
+# Go mode: ll focuses the directory preview, hh focuses the parent.
+Type "g"
+Sleep 1.2s
+Type "l"
+Sleep 450ms
+Type "l"
+Sleep 500ms
+Down
 Sleep 800ms
-Right
-Sleep 800ms
-Down@300ms 1
-Sleep 800ms
-Up@300ms 1
+Type "g"
+Sleep 1.2s
+Type "hh"
 Sleep 800ms
 
-# Toggle visibility.
-Type "."
+# Jump directly from widgets/ to miller.rs in the directory preview.
+Type "g"
 Sleep 800ms
-Type "."
-Sleep 800ms
-Type "q"
-Sleep 500ms
+Type "l"
+Sleep 450ms
+Type "b"
+Sleep 1.5s
 
 Hide
 Type ":q!"
