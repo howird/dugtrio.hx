@@ -26,6 +26,7 @@
         'back "h"
         'refresh "R"
         'toggle-hidden "."
+        'jump "g"
         'quit "q"))
 
 ;; looks up which action (if any) a keypress is bound to
@@ -140,7 +141,16 @@
   (unless (= (dugtrio-cursor col) v) (dugtrio-preview-defer!))
   (set-box! (DugtrioColumn-cursor col) v))
 
-(define (dugtrio-active-column) (last *dugtrio-stack*))
+;; Steel's `last` can fail on a prefix returned by `take`. Build a fresh
+;; list when truncating the stack so subsequent list operations work normally.
+(define (dugtrio-stack-prefix n)
+  (let loop ([cols *dugtrio-stack*] [remaining n] [kept '()])
+    (if (= remaining 0)
+        (reverse kept)
+        (loop (cdr cols) (- remaining 1) (cons (car cols) kept)))))
+
+(define (dugtrio-active-column)
+  (last *dugtrio-stack*))
 
 (define (dugtrio-column-entry col)
   (define entries (DugtrioColumn-entries col))
@@ -195,17 +205,26 @@
                                      name-width))))
   event-result/consume)
 
-(define (dugtrio-enter! open-file?)
-  (define entry (dugtrio-current-entry))
-  (define path (and entry (directory-entry-path entry)))
+(define (dugtrio-entry-kind path open-file?)
   (cond
-    [(not path) event-result/consume]
-    [(is-dir? path) (dugtrio-descend! path)]
-    [(and open-file? (is-file? path))
+    [(not path) #f]
+    [(is-dir? path) 'dir]
+    [(and open-file? (is-file? path)) 'file]
+    [else #f]))
+
+(define (dugtrio-enter-path! path kind)
+  (cond
+    [(equal? kind 'dir) (dugtrio-descend! path)]
+    [(equal? kind 'file)
      (dugtrio-close!)
      (enqueue-thread-local-callback (lambda () (helix.open path)))
      event-result/consume]
     [else event-result/consume]))
+
+(define (dugtrio-enter! open-file?)
+  (define entry (dugtrio-current-entry))
+  (define path (and entry (directory-entry-path entry)))
+  (dugtrio-enter-path! path (dugtrio-entry-kind path open-file?)))
 
 ;; steps back to the parent column
 (define (dugtrio-back!)
@@ -213,7 +232,7 @@
   (when (> depth 1)
     (dugtrio-preview-invalidate!)
     (dugtrio-remember-selection!)
-    (set! *dugtrio-stack* (take *dugtrio-stack* (- depth 1)))))
+    (set! *dugtrio-stack* (dugtrio-stack-prefix (- depth 1)))))
 
 ;; Re-lists every column from the root down. A column whose directory is no
 ;; longer listed in its parent (hidden, ignored or deleted) is dropped along
@@ -339,10 +358,13 @@
 (define *dugtrio-preview-hold* #f) ; generation the preview is waiting on, or #f
 (define *dugtrio-preview-last-size* #f) ; (width . height) of the last prepared preview pane
 
-;; the next render prepares the preview straight away
+;; The next render can use or prepare the preview without waiting.
+(define (dugtrio-preview-release-hold!)
+  (set! *dugtrio-preview-hold* #f))
+
 (define (dugtrio-preview-invalidate!)
   (set! *dugtrio-preview-cache* #f)
-  (set! *dugtrio-preview-hold* #f))
+  (dugtrio-preview-release-hold!))
 
 ;; the preview is prepared once the cursor has stayed put for the delay
 (define (dugtrio-preview-defer!)
@@ -355,7 +377,7 @@
    *dugtrio-preview-delay-ms*
    (lambda ()
      (when (equal? *dugtrio-preview-hold* gen)
-       (set! *dugtrio-preview-hold* #f)))))
+       (dugtrio-preview-release-hold!)))))
 
 (define (dugtrio-preview entry)
   (cond
@@ -380,7 +402,8 @@
             (list kind data width (dugtrio-landing-index path data))
             (list kind data width)))]))
 
-(struct DugtrioState (session blink-bright? blink-pending?))
+;; The jump targets and height describe the active column's last rendered frame.
+(struct DugtrioState (session blink-bright? blink-pending? active-height jump-prefix jump-targets))
 
 (define (dugtrio-schedule-blink! state)
   (define pending? (DugtrioState-blink-pending? state))
@@ -402,34 +425,116 @@
 ;; highlight-index is the row drawn selected: the cursor in the active column,
 ;; the child directory in an ancestor, the landing row in a directory preview.
 (struct DugtrioPane (kind content width height title highlight-index active?))
+(struct DugtrioPlacement (pane x width height))
+
+(define (dugtrio-place-panes panes x0 y frame-right frame-bottom)
+  (let loop ([remaining panes] [x x0] [placed '()])
+    (cond
+      [(null? remaining) (reverse placed)]
+      [else
+       (define pane (car remaining))
+       (define pw (min (+ (DugtrioPane-width pane) 2) (- frame-right x)))
+       (define ph (min (+ (DugtrioPane-height pane) 2) (- frame-bottom y)))
+       ;; Once a pane cannot fit its border and a cell, no later pane can fit.
+       (if (and (>= pw 3) (>= ph 3))
+           (loop (cdr remaining) (+ x pw *dugtrio-gap*)
+                 (cons (DugtrioPlacement pane x pw ph) placed))
+           (reverse placed))])))
+
+(define (dugtrio-overflow-row? row ws count h anchor)
+  ;; Keep the anchor visible even if a very short pane has no room for a marker.
+  (and (not (= (+ ws row) anchor))
+       (or (and (= row 0) (> ws 0))
+           (and (= row (- h 1)) (< (+ ws h) count)))))
+
+;; An overflow marker has a row and index but no entry. An empty listing
+;; has no rows; its placeholder is painted separately and never gets a label.
+(define (dugtrio-for-each-entry-row entries anchor h visit!)
+  (define count (length entries))
+  (define ws (dugtrio-window-start anchor count h))
+  (let loop ([items (drop entries ws)] [row 0])
+    (unless (or (null? items) (>= row h))
+      (visit! row (+ ws row)
+              (and (not (dugtrio-overflow-row? row ws count h anchor)) (car items)))
+      (loop (cdr items) (+ row 1)))))
+
+(define (dugtrio-active-label-count placements)
+  (let loop ([items placements])
+    (cond
+      [(null? items) 0]
+      [else
+       (define placement (car items))
+       (define pane (DugtrioPlacement-pane placement))
+       (if (DugtrioPane-active? pane)
+           (let ([count 0])
+             (dugtrio-for-each-entry-row
+              (DugtrioColumn-entries (DugtrioPane-content pane))
+              (DugtrioPane-highlight-index pane) (- (DugtrioPlacement-height placement) 2)
+              (lambda (row idx entry) (when entry (set! count (+ count 1)))))
+             count)
+           (loop (cdr items)))])))
+
+(define (dugtrio-column-prefixes placements active-label-count)
+  (define (eligible? placement kind)
+    (define pane (DugtrioPlacement-pane placement))
+    (and (>= (DugtrioPlacement-width placement) 4)
+         (not (DugtrioPane-active? pane)) (equal? (DugtrioPane-kind pane) kind)))
+  ;; Nearest ancestor first, then the directory preview if a letter remains.
+  (define candidates
+    (append (reverse (filter (lambda (p) (eligible? p 'col)) placements))
+            (filter (lambda (p) (eligible? p 'preview-dir)) placements)))
+  (let loop ([items candidates] [i active-label-count] [prefixes (hash)])
+    (if (or (null? items) (>= i 26))
+        prefixes
+        (loop (cdr items) (+ i 1)
+              (hash-insert prefixes (DugtrioPlacement-x (car items)) (dugtrio-letter i))))))
 
 (define (dugtrio-render-title frame x y w title style)
   (when (and title (> w 0))
     (frame-set-string! frame x y (dugtrio-truncate (dugtrio-sanitize-label title) w) style)))
 
-(define (dugtrio-render-entries frame x y0 w h entries ws highlight-index
-                                    text-style hl-style dir-style)
+(define (dugtrio-render-entry frame x y w entry hl? label label-style text-style hl-style dir-style)
+  (define dir? (directory-entry-directory? entry))
+  (define basename (directory-entry-name entry))
+  (define icon (or label (if dir? (glyph-dir-icon basename) (glyph-icon basename))))
+  (define icon-color (and (not label) (if dir? (glyph-dir-color basename) (glyph-color basename))))
+  (define row-style (cond [hl? hl-style] [dir? dir-style] [else text-style]))
+  (define name (dugtrio-sanitize-label (string-append basename (if dir? (path-separator) ""))))
+  (define icon-w (string-length icon))
+  (define avail (max 0 (- w icon-w 1)))
+  (when hl? (frame-set-string! frame x y (make-string w #\space) row-style))
+  ;; Paint the row's base style before applying the theme's jump-label overlay.
+  (when (and label (not hl?)) (frame-set-string! frame x y (make-string icon-w #\space) row-style))
+  (frame-set-string! frame x y (if (> w (+ icon-w 1)) icon (dugtrio-truncate icon w))
+                     (if label label-style (glyph-style icon-color #:base row-style)))
+  (when (> avail 0)
+    (frame-set-string! frame (+ x icon-w 1) y (dugtrio-truncate name avail) row-style)))
+
+(define (dugtrio-render-entries frame x y0 w h entries anchor highlight-index
+                                text-style hl-style dir-style label-style prefix register-label!)
+  (define label-index 0)
   (if (null? entries)
       (frame-set-string! frame x y0 (dugtrio-truncate "(empty)" w) (style-with-dim text-style))
-      (let iloop ([items (take (drop entries ws) h)] [row 0])
-        (unless (or (null? items) (>= row h))
-          (define e (car items))
-          (define idx (+ ws row))
-          (define dir? (directory-entry-directory? e))
-          (define basename (directory-entry-name e))
-          (define hl? (and highlight-index (= idx highlight-index)))
-          (define icon (if dir? (glyph-dir-icon basename) (glyph-icon basename)))
-          (define icon-color (if dir? (glyph-dir-color basename) (glyph-color basename)))
-          (define row-style (cond [hl? hl-style] [dir? dir-style] [else text-style]))
-          (define name (dugtrio-sanitize-label (string-append basename (if dir? (path-separator) ""))))
-          (define icon-w (string-length icon))
-          (define name-x (+ x icon-w 1))
-          (define avail (max 0 (- w icon-w 1)))
-          (define y (+ y0 row))
-          (when hl? (frame-set-string! frame x y (make-string w #\space) row-style))
-          (frame-set-string! frame x y icon (glyph-style icon-color #:base row-style))
-          (frame-set-string! frame name-x y (dugtrio-truncate name avail) row-style)
-          (iloop (cdr items) (+ row 1))))))
+      (dugtrio-for-each-entry-row
+       entries anchor h
+       (lambda (row idx entry)
+         (define y (+ y0 row))
+         (if entry
+             (let* ([next-letter (and prefix (< label-index 26) (dugtrio-letter label-index))]
+                    ;; The doubled column letter is reserved for focusing it.
+                    [i (if (and next-letter (equal? next-letter prefix)) (+ label-index 1) label-index)]
+                    [label (and prefix (< i 26) (string-append prefix (dugtrio-letter i)))])
+               (when label (register-label! label (directory-entry-path entry)))
+               (dugtrio-render-entry frame x y w entry
+                                     (and highlight-index (= idx highlight-index)) label label-style
+                                     text-style hl-style dir-style)
+               (set! label-index (+ i 1)))
+             (let ([dots (make-string (min w 3) #\.)])
+               (frame-set-string! frame (+ x (quotient (- w (string-length dots)) 2)) y
+                                  dots (style-with-dim text-style))))))))
+
+(define (dugtrio-letter index)
+  (string (integer->char (+ (char->integer #\a) index))))
 
 ;; file-preview panel in plain text
 (define (dugtrio-render-lines frame x y0 w h lines style)
@@ -534,14 +639,21 @@
   (define frame-right (+ (area-x frame-area) (area-width frame-area)))
   (define frame-bottom (+ (area-y frame-area) (area-height frame-area)))
 
-  (let loop ([lst visible] [x x0])
-    (unless (null? lst)
-      (define pane (car lst))
-      ;; Clip the pane to the frame. One with no room for its border and a cell
-      ;; ends the row: every pane after it sits further right.
-      (define pw (min (+ (DugtrioPane-width pane) 2) (- frame-right x)))
-      (define ph (min (+ (DugtrioPane-height pane) 2) (- frame-bottom y0)))
-      (when (and (>= pw 3) (>= ph 3))
+  (define jump-style (and (unbox (DugtrioState-jump-prefix state))
+                          (theme-scope-ref "ui.virtual.jump-label")))
+  (define targets (DugtrioState-jump-targets state))
+  (define placements (dugtrio-place-panes visible x0 y0 frame-right frame-bottom))
+  (define prefixes
+    (and jump-style
+         (dugtrio-column-prefixes placements (dugtrio-active-label-count placements))))
+  (define active-height 0)
+  (when jump-style (set-box! targets (hash)))
+  (for-each
+   (lambda (placement)
+        (define pane (DugtrioPlacement-pane placement))
+        (define x (DugtrioPlacement-x placement))
+        (define pw (DugtrioPlacement-width placement))
+        (define ph (DugtrioPlacement-height placement))
         (define kind (DugtrioPane-kind pane))
         (define content (DugtrioPane-content pane))
         (define column? (equal? kind 'col))
@@ -551,38 +663,47 @@
         (define panel-area (area x y0 pw ph))
         (define cx (+ x 1))
         (define cy (+ y0 1))
+        (when active? (set! active-height h))
 
         (define border-style (if active? active-border-style inactive-border-style))
         (define title-style (if active? (style-with-bold active-border-style) dim-text-style))
         (buffer/clear-with frame panel-area bg-style)
         (block/render frame panel-area (make-block bg-style border-style "all" "rounded"))
-        (dugtrio-render-title frame cx y0 w (DugtrioPane-title pane) title-style)
+        (define column-prefix (and prefixes (hash-try-get prefixes x)))
+        (if column-prefix
+            (begin
+              (frame-set-string! frame cx y0 (string-append column-prefix column-prefix) jump-style)
+              (when (>= w 3) (frame-set-string! frame (+ cx 2) y0 " " title-style))
+              (dugtrio-render-title frame (+ cx 3) y0 (- w 3) (DugtrioPane-title pane) title-style))
+            (dugtrio-render-title frame cx y0 w (DugtrioPane-title pane) title-style))
 
         (cond
           [(or column? (equal? kind 'preview-dir))
            (define entries (if column? (DugtrioColumn-entries content) content))
            (define highlight-index (DugtrioPane-highlight-index pane))
-           (define count (length entries))
-           (define ws
-             (cond
-               [highlight-index (dugtrio-window-start highlight-index count h)]
-               ;; an ancestor whose child is gone from its listing scrolls to its own cursor
-               [else (dugtrio-window-start (if column? (dugtrio-cursor content) 0) count h)]))
-           (dugtrio-render-entries frame cx cy w h entries ws highlight-index
+           ;; An ancestor whose child is gone from its listing scrolls to its own cursor.
+           (define anchor (or highlight-index (if column? (dugtrio-cursor content) 0)))
+           (define prefix (and jump-style (if active? "" column-prefix)))
+           (define path (if column? (DugtrioColumn-path content) (directory-entry-path entry)))
+           (define (register-label! label entry-path)
+             (set-box! targets (hash-insert (unbox targets) label (cons path entry-path))))
+           (when column-prefix (register-label! (string-append column-prefix column-prefix) #f))
+           (dugtrio-render-entries frame cx cy w h entries anchor highlight-index
                                    (if column? text-style dim-text-style)
                                    (if active? active-hl-style hl-style)
-                                   (if column? dir-style dim-dir-style))]
+                                   (if column? dir-style dim-dir-style)
+                                   jump-style prefix register-label!)]
           [(equal? kind 'preview-file)
            (dugtrio-render-lines frame cx cy w h content dim-text-style)]
           [(equal? kind 'preview-pending) void]
           [else
-           (frame-set-string! frame cx cy (dugtrio-truncate "(empty)" w) dim-text-style)])
-
-        (loop (cdr lst) (+ x pw *dugtrio-gap*)))))
+           (frame-set-string! frame cx cy (dugtrio-truncate "(empty)" w) dim-text-style)]))
+   placements)
+  (set-box! (DugtrioState-active-height state) active-height)
   (when (or *dugtrio-blink-border* (and *dugtrio-blink-selection* entry))
     (dugtrio-schedule-blink! state)))
 
-(define (dugtrio-command-action! action)
+(define (dugtrio-command-action! state action)
   (cond
     [(equal? action 'down) (dugtrio-move! 1) event-result/consume]
     [(equal? action 'up) (dugtrio-move! -1) event-result/consume]
@@ -591,15 +712,82 @@
     [(equal? action 'quit) (dugtrio-close!) event-result/consume]
     [(equal? action 'refresh) (dugtrio-refresh-all!) event-result/consume]
     [(equal? action 'toggle-hidden) (dugtrio-toggle-hidden!) event-result/consume]
+    [(equal? action 'jump)
+     ;; Render any directory preview before assigning its labels.
+     (dugtrio-preview-release-hold!)
+     (set-box! (DugtrioState-jump-prefix state) "")
+     event-result/consume]
     [else event-result/consume]))
+
+(define (dugtrio-focus-stack-column! index)
+  (define kept (+ index 1))
+  (when (< kept (length *dugtrio-stack*))
+    (dugtrio-preview-invalidate!)
+    (dugtrio-remember-selection!)
+    (set! *dugtrio-stack* (dugtrio-stack-prefix kept))))
+
+(define (dugtrio-follow-label! target)
+  (define path (car target))
+  (define entry-path (cdr target))
+  (define index (dugtrio-entry-index *dugtrio-stack* DugtrioColumn-path path))
+  (define col (and index (list-ref *dugtrio-stack* index)))
+  ;; Only the current directory preview can name a column not on the stack.
+  (define current (and (not col) (dugtrio-current-entry)))
+  (define preview-dir?
+    (and current (equal? path (directory-entry-path current)) (is-dir? path)))
+  (cond
+    [(not entry-path)
+     (cond [col (dugtrio-focus-stack-column! index)]
+           [preview-dir? (dugtrio-descend! path)])
+     event-result/consume]
+    [else
+     ;; Resolve and check the row before committing to a different column.
+     (define entries
+       (cond
+         [col (DugtrioColumn-entries col)]
+         [preview-dir?
+          (define preview (dugtrio-preview current))
+          (if (equal? (car preview) 'dir) (cadr preview) '())]
+         [else '()]))
+     (define row (dugtrio-entry-index entries directory-entry-path entry-path))
+     (define kind (and row (dugtrio-entry-kind entry-path #t)))
+     (when kind
+       (if col (dugtrio-focus-stack-column! index) (dugtrio-descend! path))
+       ;; Entering immediately invalidates the preview; no cursor debounce needed.
+       (set-box! (DugtrioColumn-cursor (dugtrio-active-column)) row)
+       (dugtrio-enter-path! entry-path kind))
+     event-result/consume]))
+
+(define (dugtrio-handle-jump! state key)
+  (define prefix (DugtrioState-jump-prefix state))
+  (define targets (DugtrioState-jump-targets state))
+  (define labels (unbox targets))
+  (define target (and key labels (hash-try-get labels (string-append (unbox prefix) key))))
+  (cond
+    [(and key labels (equal? (unbox prefix) "")
+          (hash-try-get labels (string-append key key)))
+     (set-box! prefix key)
+     event-result/consume]
+    [else
+     (set-box! prefix #f)
+     (set-box! targets #f)
+     (if target (dugtrio-follow-label! target) event-result/consume)]))
 
 (define (dugtrio-handle-keys state event)
   (define ch (key-event-char event))
   (define mods (key-event-modifier event))
+  (define plain? (or (not mods) (= mods 0) (= mods key-modifier-shift)))
   (cond
-    ;; Ctrl, Alt and Super chords are not ours. Shift stays, since "R" and "+"
+    [(unbox (DugtrioState-jump-prefix state))
+     (dugtrio-handle-jump! state (and plain? (char? ch) (string ch)))]
+    [(and mods (= mods key-modifier-ctrl) (or (equal? ch #\d) (equal? ch #\u)))
+     (define h (unbox (DugtrioState-active-height state)))
+     (when (> h 0)
+       (dugtrio-move! (* (if (equal? ch #\d) 1 -1) (max 1 (quotient h 2)))))
+     event-result/consume]
+    ;; Ignore other Ctrl, Alt and Super chords. Shift stays, since "R" and "+"
     ;; can arrive with the shift bit set.
-    [(not (or (not mods) (= mods 0) (= mods key-modifier-shift))) event-result/consume]
+    [(not plain?) event-result/consume]
     [(key-event-down? event) (dugtrio-move! 1) event-result/consume]
     [(key-event-up? event) (dugtrio-move! -1) event-result/consume]
     [(key-event-right? event) (dugtrio-enter! #f)]
@@ -609,20 +797,20 @@
 
     [(char? ch)
      (define action (dugtrio-action-for-char ch))
-     (if action (dugtrio-command-action! action) event-result/consume)]
+     (if action (dugtrio-command-action! state action) event-result/consume)]
 
     [else event-result/consume]))
 
 (define (dugtrio-handle-event state event)
   (cond
-    ;; Ignore mouse input without letting it reach the buffer behind the explorer.
-    [(mouse-event? event) event-result/consume]
+    ;; Mouse and other non-key events must not dismiss jump mode.
+    [(not (key-event? event)) event-result/consume]
     [else
      (set-box! (DugtrioState-blink-bright? state) 'fresh)
      (dugtrio-handle-keys state event)]))
 
 (define (dugtrio-make-component)
-  (new-component! "dugtrio" (DugtrioState *dugtrio-session* (box #t) (box #f))
+  (new-component! "dugtrio" (DugtrioState *dugtrio-session* (box #t) (box #f) (box 0) (box #f) (box #f))
                   dugtrio-render (hash "handle_event" dugtrio-handle-event)))
 
 ;;@doc

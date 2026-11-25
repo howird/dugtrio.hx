@@ -36,12 +36,18 @@ By default, only the active column’s selection highlight alternates between no
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` / `j` / `k` | Move within the active column |
+| `Ctrl-d` / `Ctrl-u` | Move down / up by half the active column’s visible height |
+| `g`, then a label | Open the labeled file or enter the labeled directory; repeat a column letter to focus that column |
 | `→` / `l` | Cascade into the selected directory; do nothing on files |
 | `Enter` | Open the selected file or cascade into the selected directory |
 | `←` / `h` | Back up to the parent column |
 | `R` | Refresh the open columns and preview |
 | `.` | Toggle dotfiles (`.env`, `.git`, etc.) |
 | `Esc` / `q` | Close the explorer |
+
+Jump labels replace the icons in visible directory listings. The active column uses `a`, `b`, and so on. Remaining letters are assigned to visible ancestors, nearest first, and then to the directory preview. For example, `ca` opens the first labeled row in column `c`, while `cc` focuses that column without opening an entry. The focus shortcut is shown in the column title. Press `Esc` or an unassigned key to cancel the labels without closing Dugtrio.
+
+A centered `...` marks more entries above or below a listing. It isn’t selectable and doesn’t get a jump label.
 
 Dotfiles are shown by default. When a refreshed listing still contains the selected entry, Dugtrio keeps it selected. If the entry disappears, the cursor stays at the same row or moves to the last available row. A column whose directory is no longer listed in its parent (hidden, ignored or deleted) is closed, along with the columns below it.
 
